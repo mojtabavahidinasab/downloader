@@ -1,0 +1,329 @@
+name: 📚 05-Anna's Archive Search & Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: 'Book title, author, or ISBN to search'
+        required: true
+        type: string
+        default: 'programming'
+      limit:
+        description: 'Number of results to fetch (max 50)'
+        required: false
+        default: 10
+        type: number
+      media_type:
+        description: 'Type of content'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - book
+          - magazine
+          - comic
+      auto_download:
+        description: 'Automatically download first result?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      password:
+        description: 'Password for zip files (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  search-and-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip curl jq python3-pip
+          pip3 install yt-dlp --break-system-packages 2>/dev/null || pip3 install yt-dlp
+
+      - name: Configure Git for Large Files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+
+      - name: Search Anna's Archive
+        id: search
+        run: |
+          SEARCH="${{ github.event.inputs.search_query }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+          MEDIA="${{ github.event.inputs.media_type }}"
+          
+          # URL encode search query
+          ENCODED_SEARCH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$SEARCH'))")
+          
+          echo "🔍 Searching Anna's Archive for: $SEARCH"
+          echo "🌐 https://annas-archive.org"
+          echo ""
+          
+          # Anna's Archive public API
+          API_URL="https://annas-archive.org/api/1.0/search/${ENCODED_SEARCH}?limit=${LIMIT}"
+          
+          if [ "$MEDIA" != "all" ]; then
+            API_URL="${API_URL}&media_type=${MEDIA}"
+          fi
+          
+          echo "📡 API URL: $API_URL"
+          echo ""
+          
+          # Fetch results
+          curl -s "$API_URL" \
+            -H "User-Agent: GitHub-Actions-AnnaSearch/1.0" \
+            -o anna_results.json
+          
+          # Check if we got results
+          TOTAL=$(jq -r '.total_results // 0' anna_results.json)
+          echo "📊 Total results found: $TOTAL"
+          echo "total_results=$TOTAL" >> $GITHUB_OUTPUT
+          
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "❌ No results found!"
+            exit 1
+          fi
+          
+          # Save first result for auto-download
+          FIRST_TITLE=$(jq -r '.items[0].title // ""' anna_results.json)
+          FIRST_MD5=$(jq -r '.items[0].md5 // ""' anna_results.json)
+          echo "first_title=$FIRST_TITLE" >> $GITHUB_OUTPUT
+          echo "first_md5=$FIRST_MD5" >> $GITHUB_OUTPUT
+          
+          # Generate search report
+          cat > SEARCH_REPORT.md << 'EOF'
+          # 📚 Anna's Archive Search Results
+          
+          Search completed: $(date '+%Y-%m-%d %H:%M:%S UTC')
+          
+          ## Search Query: ${{ github.event.inputs.search_query }}
+          
+          **Total results found:** $TOTAL
+          
+          ---
+          
+          ## Results
+          
+          EOF
+          
+          # Parse and format each result
+          jq -r '.items[] | 
+            "### \(.title // "No title")\n" +
+            "- **Author(s):** \(.authors // ["Unknown"] | join(", "))\n" +
+            "- **Year:** \(.publisher_year // "Unknown")\n" +
+            "- **Language:** \(.language // "Unknown")\n" +
+            "- **Publisher:** \(.publisher // "Unknown")\n" +
+            "- **Extension:** \(.extension // "Unknown")\n" +
+            "- **Size:** \(.files[0].size // 0 | tonumber | .\/1048576 | floor) MB\n" +
+            "- **MD5:** `\(.md5 // "N/A")`\n" +
+            "- **Anna\'s Archive Link:** https://annas-archive.org/md5/\(.md5)\n" +
+            "\n---\n"' anna_results.json >> SEARCH_REPORT.md
+          
+          echo "✅ Search report saved to SEARCH_REPORT.md"
+          
+          # Also save as JSON for programmatic use
+          cp anna_results.json "search_$(date +%Y%m%d_%H%M%S).json"
+
+      - name: Display search summary
+        run: |
+          echo "## 🔎 Anna's Archive Search Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Query:** ${{ github.event.inputs.search_query }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Results found:** ${{ steps.search.outputs.total_results }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          jq -r '.items[0:5] | .[] | "- **\(.title // "?")** by \(.authors // ["?"] | join(", "))" | sub("\\|"; " ") | sub("\\n"; " ")' anna_results.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "_No results to display_" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📄 Full report in [SEARCH_REPORT.md](SEARCH_REPORT.md)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Auto-download first result
+        if: github.event.inputs.auto_download == 'true'
+        run: |
+          MD5="${{ steps.search.outputs.first_md5 }}"
+          TITLE="${{ steps.search.outputs.first_title }}"
+          
+          if [ -z "$MD5" ] || [ "$MD5" = "null" ]; then
+            echo "❌ No valid MD5 found for download"
+            exit 1
+          fi
+          
+          echo "📥 Auto-downloading: $TITLE"
+          echo "🔗 MD5: $MD5"
+          
+          # Anna's Archive download page
+          DOWNLOAD_PAGE="https://annas-archive.org/md5/${MD5}"
+          
+          echo "📍 Download page: $DOWNLOAD_PAGE"
+          
+          # Fetch the download page to get actual file URL
+          curl -s -L "$DOWNLOAD_PAGE" \
+            -H "User-Agent: Mozilla/5.0" \
+            -o download_page.html
+          
+          # Extract slow download URL (free tier)
+          # Note: Anna's Archive uses Cloudflare protection, direct download may fail
+          SLOW_URL=$(grep -oP 'https?://[^"\047]+\.annas-archive\.org[^"\047]+' download_page.html | head -1)
+          
+          if [ -n "$SLOW_URL" ]; then
+            echo "✅ Found download URL: $SLOW_URL"
+            
+            # Sanitize filename
+            SAFE_TITLE=$(echo "$TITLE" | tr ' /:' '_' | tr -d '[]{}()' | cut -c1-100)
+            FILENAME="${SAFE_TITLE}.pdf"
+            
+            # Download using aria2c or curl
+            echo "⬇️ Downloading to: $FILENAME"
+            
+            mkdir -p downloads_anna
+            
+            # Try aria2c first
+            if aria2c --split=2 --max-connection-per-server=2 \
+              --dir="downloads_anna" --out="$FILENAME" \
+              --check-certificate=false \
+              "$SLOW_URL" 2>&1; then
+              echo "✅ Download complete: $FILENAME"
+            else
+              # Fallback to curl
+              curl -L -# -o "downloads_anna/$FILENAME" \
+                -A "Mozilla/5.0" \
+                -H "Referer: https://annas-archive.org" \
+                "$SLOW_URL"
+              
+              if [ -f "downloads_anna/$FILENAME" ] && [ -s "downloads_anna/$FILENAME" ]; then
+                echo "✅ Download complete via curl: $FILENAME"
+              else
+                echo "⚠️ Download may have failed or file is empty"
+              fi
+            fi
+            
+            # Create README for downloaded book
+            mkdir -p "downloads_anna/${SAFE_TITLE}"
+            cat > "downloads_anna/${SAFE_TITLE}/README.md" << EOF
+            # $TITLE
+            
+            ## Download Information
+            
+            | Property | Value |
+            |----------|-------|
+            | **File** | \`${FILENAME}\` |
+            | **MD5** | \`${MD5}\` |
+            | **Source** | [Anna's Archive](${DOWNLOAD_PAGE}) |
+            | **Date** | $(date '+%Y-%m-%d %H:%M:%S UTC') |
+            
+            ---
+            
+            *Downloaded using GitHub Actions - annas-archive.org*
+            EOF
+            
+          else
+            echo "❌ Could not extract download URL from Anna's Archive"
+            echo "   Note: Anna's Archive uses protection. Try manual download."
+          fi
+
+      - name: Commit search results and downloads
+        run: |
+          # Create annas-archive directory
+          mkdir -p annas-archive
+          
+          # Move search report to annas-archive folder with timestamp
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          SEARCH_TERM="${{ github.event.inputs.search_query }}"
+          SAFE_TERM=$(echo "$SEARCH_TERM" | tr ' /:' '_' | cut -c1-50)
+          
+          if [ -f SEARCH_REPORT.md ]; then
+            mv SEARCH_REPORT.md "annas-archive/search_${SAFE_TERM}_${TIMESTAMP}.md"
+          fi
+          
+          if [ -f anna_results.json ]; then
+            mv anna_results.json "annas-archive/results_${SAFE_TERM}_${TIMESTAMP}.json"
+          fi
+          
+          # Move downloaded files if any
+          if [ -d downloads_anna ] && [ "$(ls -A downloads_anna 2>/dev/null)" ]; then
+            mkdir -p annas-archive/downloads
+            cp -r downloads_anna/* annas-archive/downloads/
+          fi
+          
+          # Update master index
+          cat > annas-archive/README.md << 'EOF'
+          # 📚 Anna's Archive Search History
+          
+          This directory contains search results and downloads from [Anna's Archive](https://annas-archive.org).
+          
+          ## Search Files
+          
+          EOF
+          
+          # List all search files
+          for file in annas-archive/search_*.md; do
+            if [ -f "$file" ]; then
+              BASENAME=$(basename "$file")
+              echo "- [$BASENAME]($BASENAME)" >> annas-archive/README.md
+            fi
+          done
+          
+          echo "" >> annas-archive/README.md
+          echo "## Downloads" >> annas-archive/README.md
+          echo "" >> annas-archive/README.md
+          
+          for download in annas-archive/downloads/*/; do
+            if [ -d "$download" ]; then
+              echo "- [$(basename "$download")](downloads/$(basename "$download")/)" >> annas-archive/README.md
+            fi
+          done
+          
+          echo "" >> annas-archive/README.md
+          echo "---" >> annas-archive/README.md
+          echo "*Generated by GitHub Actions*" >> annas-archive/README.md
+          
+          # Git operations
+          git add annas-archive/
+          git add downloads_anna/ 2>/dev/null || true
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "📚 Anna's Archive search: ${{ github.event.inputs.search_query }} [skip ci]"
+            
+            # Push with retry
+            for i in {1..5}; do
+              if git push origin HEAD:${GITHUB_REF_NAME} 2>/dev/null; then
+                echo "✅ Push successful"
+                break
+              fi
+              echo "Push attempt $i failed, retrying..."
+              sleep 5
+              git pull --rebase origin ${GITHUB_REF_NAME} 2>/dev/null || true
+            done
+          else
+            echo "No changes to commit"
+          fi
+          
+          echo "✅ Saved to annas-archive/ directory"
+
+      - name: Summary
+        run: |
+          echo "## 📚 Anna's Archive Operations Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Search query:** ${{ github.event.inputs.search_query }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Results found:** ${{ steps.search.outputs.total_results }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-download:** ${{ github.event.inputs.auto_download }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📁 Results saved to \`annas-archive/\` folder" >> $GITHUB_STEP_SUMMARY
